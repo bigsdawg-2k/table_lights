@@ -3,10 +3,9 @@
 #include <FastLED.h>
 #include <FastLED_RGBW.h>
 
-#include <BLEDevice.h>
-#include <BLEServer.h>
-#include <BLEUtils.h>
-#include <BLE2902.h>
+#include <BluetoothSerial.h>
+
+#include <cmdBuffer.h>
 
 // GPIO for LED on development board
 #define PIN_LED_BUILTIN 2
@@ -15,115 +14,99 @@
 #define NUM_LEDS 20
 #define DATA_PIN 23
 
+#define NUM_BYTES_COMMAND_BUFF 1024
+#define NUM_BYTES_SERIAL_BT_BUFF 1024
+
+// LED pattern
+// 0: off
+// 1: static on
+int ledPattern = 0;
+
 // Define the array of LEDs RGBW struct
 CRGBW leds[NUM_LEDS];
 CRGB *ledsRGB = (CRGB *) &leds[0];
 
-// BLE server setup
-BLEServer *pServer = NULL;
-BLECharacteristic * pTxCharacteristic;
-bool deviceConnected = false;
-bool oldDeviceConnected = false;
-uint8_t txValue = 0;
+// Serial over bluetooth state
+BluetoothSerial SerialBT;
 
-#define SERVICE_UUID           "242FC2C3-FC6A-4D48-8C86-6DC143A5d684"
-#define CHARACTERISTIC_UUID_RX "1730e01c-ec0d-48b9-a8ee-5c6f96c652c7"
-#define CHARACTERISTIC_UUID_TX "f5b1ad65-8492-4175-a8ba-da839ee5638f"
+// Buffer that will be used to store commands received over BT
+CmdBuffer* cmdBuf = new CmdBuffer(NUM_BYTES_SERIAL_BT_BUFF);
 
-class MyServerCallbacks: public BLEServerCallbacks {
-    void onConnect(BLEServer* pServer) {
-      deviceConnected = true;
-    };
+// Miscellaneous buffer for string processing
+char strBuffer [1024];
 
-    void onDisconnect(BLEServer* pServer) {
-      deviceConnected = false;
+void BTEventCallback(esp_spp_cb_event_t event, esp_spp_cb_param_t *param){
+    switch (event) {
+    case ESP_SPP_SRV_OPEN_EVT:
+        Serial.println("Client Connected");
+        break;
+    case ESP_SPP_CLOSE_EVT:
+        Serial.println("Client disconnected");
+        break;
+    case ESP_SPP_DATA_IND_EVT:
+        Serial.println("Received data: ");
+        // TODO sanitize buffer room
+        //std::copy(param->data_ind.data, param->data_ind.data + param->data_ind.len, commandBuffer + commandBufferBytes);
+        //commandBufferBytes += param->data_ind.len;
+
+        if(cmdBuf->getFree() >= param->data_ind.len){
+            cmdBuf->write(param->data_ind.data, param->data_ind.len);
+        } 
+        else {
+            // Eventually do something more useful here
+            Serial.println("Buffer overflow detected in serial buffer");
+        }
+        break;
+    default:
+        Serial.println("Other event!");
     }
-};
+}
 
-class MyCallbacks: public BLECharacteristicCallbacks {
-    void onWrite(BLECharacteristic *pCharacteristic) {
-      std::string rxValue = pCharacteristic->getValue();
+// This gets set as the default handler, and gets called when no other command matches.
+void Unrecognized(const char *command) {
+    Serial.print("Unrecognized command: ");
+    Serial.println(command);
+}
 
-      if (rxValue.length() > 0) {
-        Serial.println("*********");
-        Serial.print("Received Value: ");
-        for (int i = 0; i < rxValue.length(); i++)
-          Serial.print(rxValue[i]);
-
-        Serial.println();
-        Serial.println("*********");
-      }
+void UpdateLedPattern (int pattern) {
+    
+    switch ( pattern )
+    {
+    case 0:
+    case 1:
+        ledPattern = pattern;
+        break;
+    default:
+        sprintf(strBuffer, "Unrecognized state: %d", pattern);
+        Serial.println(strBuffer);
     }
-};
+    
+}
 
 void setup() {
 
+    // Serial over USB settings
     Serial.begin(115200);
 
-    // Create the BLE Device
-    BLEDevice::init("UART Service");
+    // Serial over BT settings
+    SerialBT.register_callback(BTEventCallback);
+    if (!SerialBT.begin("Table Lights")) {
+        Serial.println("An error occurred initializing Bluetooth");
+    }
+    else {
+        Serial.println("Bluetooth initialized");
+    }
 
-    // Create the BLE Server
-    pServer = BLEDevice::createServer();
-    pServer->setCallbacks(new MyServerCallbacks());
-
-    // Create the BLE Service
-    BLEService *pService = pServer->createService(SERVICE_UUID);
-
-    // Create a BLE Characteristic
-    pTxCharacteristic = pService->createCharacteristic(
-	    CHARACTERISTIC_UUID_TX,
-		BLECharacteristic::PROPERTY_NOTIFY
-		);
-                      
-    pTxCharacteristic->addDescriptor(new BLE2902());
-
-    BLECharacteristic * pRxCharacteristic = pService->createCharacteristic(
-	    CHARACTERISTIC_UUID_RX,
-		BLECharacteristic::PROPERTY_WRITE
-		);
-
-    pRxCharacteristic->setCallbacks(new MyCallbacks());
-
-    // Start the service
-    pService->start();
-
-    // Start advertising
-    pServer->getAdvertising()->start();
-    Serial.println("Waiting a client connection to notify...");
-
-    // put your setup code here, to run once:
+    // Physical LED on development kit
     pinMode(PIN_LED_BUILTIN, OUTPUT);
 
     // Setup LED strip for FastLED with RGBW
     // FastLED.addLeds<WS2812B, DATA_PIN, RGB>(leds, NUM_LEDS);  // This is the unmodified call for reference
     FastLED.addLeds<WS2812B, DATA_PIN, RGB>(ledsRGB, getRGBWsize(NUM_LEDS));
-
+    
 }
 
 void loop() {
-  
-    if (deviceConnected) {
-        //pTxCharacteristic->setValue(&txValue, 1);
-        uint8_t a = 83;
-        pTxCharacteristic->setValue(&a, 1);
-        pTxCharacteristic->notify();
-        txValue++;
-		delay(10); // bluetooth stack will go into congestion, if too many packets are sent
-	}
-
-    // disconnecting
-    if (!deviceConnected && oldDeviceConnected) {
-        delay(500); // give the bluetooth stack the chance to get things ready
-        pServer->startAdvertising(); // restart advertising
-        Serial.println("start advertising");
-        oldDeviceConnected = deviceConnected;
-    }
-    // connecting
-    if (deviceConnected && !oldDeviceConnected) {
-		// do stuff here on connecting
-        oldDeviceConnected = deviceConnected;
-    }
     
     // put your main code here, to run repeatedly:
     // Builtin LED is left in as a sanity check
@@ -154,5 +137,22 @@ void loop() {
     digitalWrite(PIN_LED_BUILTIN, LOW);
   
     delay(100);
+
+    // See if anything new is in the serial buffer
+    //if (lastSerBufSize == rbSerBuf->getOccupied()){
+    //    numCmds = ;
+    //}
+
+    if (cmdBuf->getOccupied() > 0) {
+        // TODO How to make sure there are no conflicts when reading out the buffer
+        Serial.print("Buffer: ");
+        cmdBuf->readToEnd((uint8_t *)strBuffer);
+        Serial.println(strBuffer);
+    }
+    
+    // Display the current LED state
+    sprintf(strBuffer, "LED Pattern: %d", ::ledPattern);
+    Serial.println(strBuffer);
  
 }
+
