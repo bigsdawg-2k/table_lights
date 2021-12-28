@@ -45,12 +45,12 @@ void BTEventCallback(esp_spp_cb_event_t event, esp_spp_cb_param_t *param){
         break;
     case ESP_SPP_DATA_IND_EVT:
         Serial.println("Received data: ");
+        
         // TODO sanitize buffer room
         //std::copy(param->data_ind.data, param->data_ind.data + param->data_ind.len, commandBuffer + commandBufferBytes);
         //commandBufferBytes += param->data_ind.len;
-
-        if(cmdBuf->getFree() >= param->data_ind.len){
-            cmdBuf->write(param->data_ind.data, param->data_ind.len);
+        if(cmdBuf->getFreeSerBuf() >= param->data_ind.len){
+            cmdBuf->write((char *)param->data_ind.data, param->data_ind.len);
         } 
         else {
             // Eventually do something more useful here
@@ -146,7 +146,8 @@ void loop() {
     if (cmdBuf->getOccupied() > 0) {
         // TODO How to make sure there are no conflicts when reading out the buffer
         Serial.print("Buffer: ");
-        cmdBuf->readToEnd((uint8_t *)strBuffer);
+        //cmdBuf->readToEnd((uint8_t *)strBuffer);
+        // TODO: replace with get command
         Serial.println(strBuffer);
     }
     
