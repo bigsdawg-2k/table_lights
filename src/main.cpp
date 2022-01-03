@@ -70,13 +70,20 @@ void BTEventCallback(esp_spp_cb_event_t event, esp_spp_cb_param_t *param)
             // TODO sanitize buffer room
             //std::copy(param->data_ind.data, param->data_ind.data + param->data_ind.len, commandBuffer + commandBufferBytes);
             //commandBufferBytes += param->data_ind.len;
-            if (cmdBuf->getFreeSerBuf() >= param->data_ind.len)
+            if (cmdBuf->getFree() >= param->data_ind.len)
             {
                 // TODO replace hardcoded 10ms delay
+                Serial.println("Trying for semaphore...");
                 if (xSemaphoreTake(xBinSem_cmdBuf, 10 / portTICK_PERIOD_MS) == pdTRUE)
                 {
-                    cmdBuf->write((char *)param->data_ind.data, param->data_ind.len);
+                    Serial.println("Succeeded to get Semaphore.");
+                    Serial.println("Writing command...");
+                    cmdBuf->writeCmdMsg((char *)param->data_ind.data, param->data_ind.len);
                     xSemaphoreGive(xBinSem_cmdBuf);
+                }
+                else
+                {
+                    Serial.println("Failed to get Semaphore.");
                 } 
             } 
             else
@@ -104,16 +111,42 @@ void BTEventCallback(esp_spp_cb_event_t event, esp_spp_cb_param_t *param)
  */ 
 void appTask_updateLedFsmState (void * parameter)
 {
+    
+    static cmdItem tmpCmd;
+    static int tmpInt;
+
     // TODO: Placeholder 'code'
     for(;;)
     {
         if (cmdBuf->getOccupied() > 0 && 
             xSemaphoreTake(xBinSem_cmdBuf, 10 / portTICK_PERIOD_MS)) // TODO remove hardcoded 10ms delay
         {
-            cmdBuf->
+            tmpInt = cmdBuf->readCmd(&tmpCmd);
             xSemaphoreGive(xBinSem_cmdBuf);
         }
-        Serial.println("Nothing to report...");
+
+        if (tmpInt > 0)
+        {
+            Serial.print("Received command: ");
+            Serial.print(tmpCmd.moduleTarget);
+            Serial.print(", ");
+            Serial.print(tmpCmd.instruction);
+            Serial.print(", ");
+            Serial.print(tmpCmd.vArgLen);
+            for (tmpInt = 0; tmpInt < tmpCmd.vArgLen; tmpInt++)
+            {
+                if (tmpInt == 0) {Serial.print(":");}
+                Serial.print(tmpCmd.vArg[tmpInt]);
+                Serial.print(".");
+            }
+            Serial.println("");
+            tmpInt = 0;
+        }
+        else
+        {
+            Serial.println("Nothing to report...");
+        }
+
         vTaskDelay(1000 / portTICK_PERIOD_MS); // TODO remove hardcoded 1s delay
     }
     
@@ -134,7 +167,7 @@ void appTask_updateLeds (void * parameter)
     // TODO: Placeholder 'code'
     for(;;)
     {
-        Serial.println("this is another Task");
+        //Serial.println("this is another Task");
         delay(1000);
     }
     
@@ -193,13 +226,14 @@ void setup()
     if (xBinSem_cmdBuf == NULL)
     {
         xBinSem_cmdBuf = xSemaphoreCreateBinary();
-        if (xBinSem_cmdBuf == NULL)
+        if (xBinSem_cmdBuf != NULL)
         {
-            Serial.write("Semaphore is null.");
+            Serial.write("Created semaphore!");
+            xSemaphoreGive(xBinSem_cmdBuf);
         }
         else
         {
-            Serial.write("Created semaphore!");
+            Serial.write("Semaphore is null.");
         }
         
     }
