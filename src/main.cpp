@@ -8,7 +8,7 @@
 #include <cmdBuffer.h>
 
 // GPIO for LED on development board
-#define PIN_LED_BUILTIN 2
+#define PIN_LEDS_BUILTIN 2
 
 // LED related defines
 #define NUM_LEDS 20
@@ -17,18 +17,24 @@
 #define NUM_BYTES_COMMAND_BUFF 1024
 #define NUM_BYTES_SERIAL_BT_BUFF 1024
 
-// LED FSM State
-#define FSM_STATE_LED_RESET     0
-#define FSM_STATE_LED_IDLE      1
-#define FSM_STATE_LED_STATIC    2
-int ledFsmState = FSM_STATE_LED_RESET;
-SemaphoreHandle_t xBinSem_ledFsmState;
+// LED FSM related
+#define LEDFSM_STATE_RESET     0
+#define LEDFSM_STATE_IDLE      1
+#define LEDFSM_STATE_UPDATE    2
+#define LEDFSM_REST_TIME_ms    10
+#define LEDFSM_REST_TIME_ticks (LEDFSM_REST_TIME_ms / portTICK_PERIOD_MS)
+
 
 // LED states
-#define LED_STATE_OFF           0
-#define LED_STATE_ON            1
-int ledState = LED_STATE_OFF;
-SemaphoreHandle_t xBinSem_ledState;
+#define LEDS_UPDATE_PERIOD_ms   50
+#define LEDS_UPDATE_PERIOD_ticks (LEDS_UPDATE_PERIOD_ms / portTICK_PERIOD_MS)
+#define LEDS_STATE_OFF          pdFALSE
+#define LEDS_STATE_ON           pdTRUE
+#define LEDS_PATTERN_OFF        0
+#define LEDS_PATTERN_STATIC_ON  1
+SemaphoreHandle_t xBinSem_ledsState;
+int gLedsState = 0;
+// TODO: 20220113 - REPLACE THIS SEMAPHORE BASED MESSAGING WITH QUEUE INTO LED_FSM
 
 // Define the array of LEDs RGBW struct
 CRGBW leds[NUM_LEDS];
@@ -149,17 +155,17 @@ void xTask_execCmd (void * parameter)
                 switch (tmpCmd.instruction)
                 {
                 case 0: // Set LED state 'off'
-                    if (xSemaphoreTake(xBinSem_ledFsmState, 10 / portTICK_PERIOD_MS)) // TODO remove hardcoded 10ms delay
-                        { ledState = LED_STATE_OFF; }
-                        Serial.println("Turning LED(s) off.\n");
-                    xSemaphoreGive(xBinSem_ledFsmState);
+                    if( xSemaphoreTake( xBinSem_ledsState, 10 / portTICK_PERIOD_MS )) // TODO remove hardcoded 10ms delay
+                        { ledsState = LEDS_STATE_OFF; }
+                    Serial.println("Turning LED(s) off.\n");
+                    xSemaphoreGive(xBinSem_ledsState);
                     break;
                 case 1: // Set LED state to arg
                     if (tmpCmd.vArgLen == 1 && 
-                        xSemaphoreTake(xBinSem_ledState, 10 / portTICK_PERIOD_MS)) // TODO remove hardcoded 10ms delay
-                        { ledState = tmpCmd.vArg[0]; }
+                        xSemaphoreTake(xBinSem_ledsState, 10 / portTICK_PERIOD_MS)) // TODO remove hardcoded 10ms delay
+                        { ledsState = tmpCmd.vArg[0]; }
                         Serial.printf("Setting LED(s) state to (%d)\n", tmpCmd.vArg[0]);
-                    xSemaphoreGive(xBinSem_ledState);
+                    xSemaphoreGive(xBinSem_ledsState);
                     break;
                 case 2: // Set LED pattern to arg
                     // TODO add this state
@@ -187,51 +193,79 @@ void xTask_execCmd (void * parameter)
    
 }
 
-/* Update LED state based on FSM state
+/* Finite state machine for LED module
  *
  * Arguments:
  *      None
  * Returns: 
  *      Nothing
  */ 
-void appTask_updateLeds (void * parameter)
+void xTask_fsdmLeds (void * parameter)
 {
-    int lastLedState = ledState;
-    while(true)
+    
+    // State variables
+    int ledFsmState = LEDFSM_STATE_RESET;
+
+    // LED variables
+    bool ledsEnabled = LEDS_STATE_OFF;
+    int ledsPattern = LEDS_PATTERN_OFF;
+
+    // Managing the updated period tracking
+    TickType_t  xTicksToUpdate = LEDS_UPDATE_PERIOD_ticks;
+    TimeOut_t   xUpdateTO;
+    
+    while (true)
     {
-        if (ledState != lastLedState)
+        switch (ledFsmState)
         {
-            Serial.printf("LED state changed to (%d)\n", ledState);
-            lastLedState = ledState;
+        
+        case LEDFSM_STATE_RESET:
+            
+            // Start the LED update timeout
+            vTaskSetTimeOutState( &xUpdateTO );
+
+            ledsEnabled = LEDS_STATE_OFF;
+            ledsPattern = LEDS_PATTERN_OFF;
+
+            ledFsmState = LEDFSM_STATE_UPDATE;
+            break;
+        
+        case LEDFSM_STATE_IDLE:
+
+            // Due for an update
+            if( xTaskCheckForTimeOut( &xUpdateTO, &xTicksToUpdate ) == pdTRUE )
+            {
+                ledFsmState = LEDFSM_STATE_UPDATE;
+                break;
+            }
+            // No update, delay
+            else if( xTicksToUpdate < LEDFSM_REST_TIME_ticks )
+            {
+                vTaskDelay( xTicksToUpdate );
+            }
+            else
+            {
+                vTaskDelay( LEDFSM_REST_TIME_ticks );
+            }
+            break;
+        
+        case LEDFSM_STATE_UPDATE:
+            
+            // Update complete, reset the update timeout
+            vTaskSetTimeOutState( &xUpdateTO );
+            
+            ledFsmState = LEDFSM_STATE_IDLE;
+            break;
+        
+        default:
+            break;
         }
-        vTaskDelay(500 / portTICK_PERIOD_MS); // TODO remove hardcoded 0.5s delay 
+
+        vTaskDelay(10 / portTICK_PERIOD_MS); // TODO remove hardcoded 0.01s delay 
     }
     
     // Delete a task when finished 
     vTaskDelete( NULL );
-}
-
-
-// This gets set as the default handler, and gets called when no other command matches.
-void Unrecognized (const char *command) 
-{
-    Serial.print("Unrecognized command: ");
-    Serial.println(command);
-}
-
-void UpdateLedPattern (int pattern) {
-    
-    switch ( pattern )
-    {
-        case 0:
-        case 1:
-            ledFsmState = pattern;
-            break;
-        default:
-            sprintf(strBuffer, "Unrecognized state: %d", pattern);
-            Serial.println(strBuffer);
-    }
-    
 }
 
 /* Setup function
@@ -263,39 +297,31 @@ void setup()
         if (xBinSem_cmdBuf != NULL) { xSemaphoreGive(xBinSem_cmdBuf); }
     }
 
-    if (xBinSem_ledFsmState == NULL)
+    if (xBinSem_ledsState == NULL)
     {
-        xBinSem_ledFsmState = xSemaphoreCreateBinary();
-        if (xBinSem_ledFsmState != NULL) { xSemaphoreGive(xBinSem_ledFsmState); }
+        xBinSem_ledsState = xSemaphoreCreateBinary();
+        if (xBinSem_ledsState != NULL) { xSemaphoreGive(xBinSem_ledsState); }
     }
-
-    if (xBinSem_ledState == NULL)
-    {
-        xBinSem_ledState = xSemaphoreCreateBinary();
-        if (xBinSem_ledState != NULL) { xSemaphoreGive(xBinSem_ledState); }
-    }
-
-
 
     // RTOS Tasks
     xTaskCreate(
         xTask_execCmd,              // Function name
-        "Execute Command",     // Task name
+        "Execute Command",          // Task name
         10000,                      // Stack size
         NULL,                       // Task parameter
         1,                          // Task priority
         NULL);                      // Task handle
 
     xTaskCreate(
-        appTask_updateLeds,         // Function name
-        "Update LEDs",              // Task name
+        xTask_fsdmLeds,             // Function name
+        "LED FSM",                  // Task name
         10000,                      // Stack size
         NULL,                       // Task parameter
         1,                          // Task priority
         NULL);                      // Task handle    
 
     // Physical LED on development kit
-    pinMode(PIN_LED_BUILTIN, OUTPUT);
+    pinMode(PIN_LEDS_BUILTIN, OUTPUT);
 
     // Setup LED strip for FastLED with RGBW
     // FastLED.addLeds<WS2812B, DATA_PIN, RGB>(leds, NUM_LEDS);  // This is the unmodified call for reference
@@ -327,14 +353,7 @@ void loop()
         leds[i] = CRGB::Black;
     
         // Builtin LED is left in as a sanity check
-        if (i % 2 == 0) {
-            digitalWrite(PIN_LED_BUILTIN, HIGH & ledState);
-        } else {
-            digitalWrite(PIN_LED_BUILTIN, LOW);
-        }
-    
-        delay(100);
-
+        
     }
 
     for (i = 0; i < NUM_LEDS; ++i) 
@@ -343,26 +362,11 @@ void loop()
     }
     
     FastLED.show();
-    digitalWrite(PIN_LED_BUILTIN, LOW);
-  
+    
     delay(100);
 
-    // See if anything new is in the serial buffer
-    //if (lastSerBufSize == rbSerBuf->getOccupied()){
-    //    numCmds = ;
-    //}
-
-    if (cmdBuf->getOccupied() > 0) 
-    {
-        // TODO How to make sure there are no conflicts when reading out the buffer
-        Serial.print("Buffer: ");
-        //cmdBuf->readToEnd((uint8_t *)strBuffer);
-        // TODO: replace with get command
-        Serial.println(strBuffer);
-    }
-    
     // Display the current LED state
-    sprintf(strBuffer, "LED Pattern: %d", ::ledState);
+    sprintf(strBuffer, "LED Pattern: %d", ::ledsState);
     Serial.println(strBuffer);
  
 }
