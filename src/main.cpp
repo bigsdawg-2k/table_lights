@@ -17,24 +17,32 @@
 #define NUM_BYTES_COMMAND_BUFF 1024
 #define NUM_BYTES_SERIAL_BT_BUFF 1024
 
-// LED FSM related
-#define LEDFSM_STATE_RESET     0
-#define LEDFSM_STATE_IDLE      1
-#define LEDFSM_STATE_UPDATE    2
-#define LEDFSM_REST_TIME_ms    10
-#define LEDFSM_REST_TIME_ticks (LEDFSM_REST_TIME_ms / portTICK_PERIOD_MS)
+// Task and OS Resource Rest Times
+#define TASK_WAIT_LEDFSM_ms     10
+#define TASK_WAIT_EXEC_CMD_ms   10
+#define Q_WAIT_LEDFSM_WAIT_ms   10
 
+// Module Targest
+#define MODULE_LED              1
+
+// LED FSM related
+#define LEDFSM_STATE_RESET      0
+#define LEDFSM_STATE_IDLE       1
+#define LEDFSM_STATE_COMMAND    2
+#define LEDFSM_STATE_UPDATE     3
+QueueHandle_t   xQLedfsm;
+
+// LED Module Instructions
+#define LEDMOD_INST_OFF         0
+#define LEDMOD_INST_ON          1
+#define LEDMOD_INST_SET_LED     2
 
 // LED states
 #define LEDS_UPDATE_PERIOD_ms   50
 #define LEDS_UPDATE_PERIOD_ticks (LEDS_UPDATE_PERIOD_ms / portTICK_PERIOD_MS)
-#define LEDS_STATE_OFF          pdFALSE
-#define LEDS_STATE_ON           pdTRUE
 #define LEDS_PATTERN_OFF        0
 #define LEDS_PATTERN_STATIC_ON  1
-SemaphoreHandle_t xBinSem_ledsState;
 int gLedsState = 0;
-// TODO: 20220113 - REPLACE THIS SEMAPHORE BASED MESSAGING WITH QUEUE INTO LED_FSM
 
 // Define the array of LEDs RGBW struct
 CRGBW leds[NUM_LEDS];
@@ -120,9 +128,8 @@ void xTask_execCmd (void * parameter)
     
     static cmdItem tmpCmd;
     static int tmpInt;
-
-    // TODO: Placeholder 'code'
-    for(;;)
+    
+    while( pdTRUE )
     {
         if (cmdBuf->getOccupied() > 0 && 
             xSemaphoreTake(xBinSem_cmdBuf, 10 / portTICK_PERIOD_MS)) // TODO remove hardcoded 10ms delay
@@ -150,31 +157,16 @@ void xTask_execCmd (void * parameter)
 
             switch (tmpCmd.moduleTarget)
             {
-            case 1: // LED module
+            
+            // LED module
+            case MODULE_LED: 
                 Serial.printf("Received command for LED module\n");
-                switch (tmpCmd.instruction)
+                if( xQueueSend( xQLedfsm, (void *) &tmpCmd, (TickType_t) Q_WAIT_LEDFSM_WAIT_ms / portTICK_PERIOD_MS ) != pdTRUE )
                 {
-                case 0: // Set LED state 'off'
-                    if( xSemaphoreTake( xBinSem_ledsState, 10 / portTICK_PERIOD_MS )) // TODO remove hardcoded 10ms delay
-                        { ledsState = LEDS_STATE_OFF; }
-                    Serial.println("Turning LED(s) off.\n");
-                    xSemaphoreGive(xBinSem_ledsState);
-                    break;
-                case 1: // Set LED state to arg
-                    if (tmpCmd.vArgLen == 1 && 
-                        xSemaphoreTake(xBinSem_ledsState, 10 / portTICK_PERIOD_MS)) // TODO remove hardcoded 10ms delay
-                        { ledsState = tmpCmd.vArg[0]; }
-                        Serial.printf("Setting LED(s) state to (%d)\n", tmpCmd.vArg[0]);
-                    xSemaphoreGive(xBinSem_ledsState);
-                    break;
-                case 2: // Set LED pattern to arg
-                    // TODO add this state
-                    break;
-                default:
-                    Serial.printf("Unrecognized instruction for LED module (%d)\n", tmpCmd.instruction);    
-                    break;
+                    // TODO: Handle failed post command to LED FSM queue
                 }
                 break;
+
             default:
                 Serial.printf("Unrecognized target module (%d)\n", tmpCmd.moduleTarget);
                 break;
@@ -185,7 +177,7 @@ void xTask_execCmd (void * parameter)
             // Serial.println("Nothing to report...");
         }
 
-        vTaskDelay(1000 / portTICK_PERIOD_MS); // TODO remove hardcoded 1s delay
+        vTaskDelay(TASK_WAIT_EXEC_CMD_ms / portTICK_PERIOD_MS);
     }
     
     // Delete a task when finished 
@@ -200,53 +192,94 @@ void xTask_execCmd (void * parameter)
  * Returns: 
  *      Nothing
  */ 
-void xTask_fsdmLeds (void * parameter)
+void xTask_fsmLeds (void * parameter)
 {
     
     // State variables
-    int ledFsmState = LEDFSM_STATE_RESET;
+    int fsmledState = LEDFSM_STATE_RESET;
 
     // LED variables
-    bool ledsEnabled = LEDS_STATE_OFF;
-    int ledsPattern = LEDS_PATTERN_OFF;
+    bool ledsEnabled = pdFALSE;
+    cmdItem cmdFromQ;
 
     // Managing the updated period tracking
     TickType_t  xTicksToUpdate = LEDS_UPDATE_PERIOD_ticks;
     TimeOut_t   xUpdateTO;
     
-    while (true)
+    while( true )
     {
-        switch (ledFsmState)
+        
+        switch( fsmledState )
         {
         
         case LEDFSM_STATE_RESET:
             
             // Start the LED update timeout
             vTaskSetTimeOutState( &xUpdateTO );
-
-            ledsEnabled = LEDS_STATE_OFF;
-            ledsPattern = LEDS_PATTERN_OFF;
-
-            ledFsmState = LEDFSM_STATE_UPDATE;
+            ledsEnabled = pdFALSE;
+            fsmledState = LEDFSM_STATE_UPDATE;
             break;
         
         case LEDFSM_STATE_IDLE:
 
+            // Check command queue
+            if( xQueueReceive(xQLedfsm, &cmdFromQ, 0) == pdTRUE )
+            {
+                fsmledState = LEDFSM_STATE_COMMAND;
+                break;
+            }
             // Due for an update
             if( xTaskCheckForTimeOut( &xUpdateTO, &xTicksToUpdate ) == pdTRUE )
             {
-                ledFsmState = LEDFSM_STATE_UPDATE;
+                fsmledState = LEDFSM_STATE_UPDATE;
                 break;
             }
-            // No update, delay
-            else if( xTicksToUpdate < LEDFSM_REST_TIME_ticks )
+            // Nothing to do, rest
+            else if( xTicksToUpdate < TASK_WAIT_LEDFSM_ms / portTICK_PERIOD_MS )
             {
                 vTaskDelay( xTicksToUpdate );
             }
             else
             {
-                vTaskDelay( LEDFSM_REST_TIME_ticks );
+                vTaskDelay( TASK_WAIT_LEDFSM_ms / portTICK_PERIOD_MS );
             }
+            break;
+        
+        // Handle command for the LED module from the queue
+        case LEDFSM_STATE_COMMAND:
+            
+            switch( cmdFromQ.instruction )
+            {
+            case LEDMOD_INST_OFF:
+                Serial.printf("Turning LED(s) off.\n");
+                ledsEnabled = pdFALSE;
+                break;
+
+            case LEDMOD_INST_ON:
+                Serial.printf("Turning LED(s) on.\n");
+                ledsEnabled = pdTRUE;
+                break;
+
+            case LEDMOD_INST_SET_LED:
+                Serial.printf("Setting LED(s) to (%d)\n", cmdFromQ.vArg[0]);
+                if( cmdFromQ.vArgLen > 0 )
+                {
+                    ledsEnabled = cmdFromQ.vArg[0];
+                }
+                break;
+
+            default:
+                Serial.printf("Unrecognized instruction for LED module (%d)\n", cmdFromQ.instruction);
+                break;
+            }
+            
+            // Get rid of any arguments now that they have been used
+            if( cmdFromQ.vArgLen > 0 )
+            {
+                free(cmdFromQ.vArg);
+            }
+
+            fsmledState = LEDFSM_STATE_IDLE;
             break;
         
         case LEDFSM_STATE_UPDATE:
@@ -254,14 +287,13 @@ void xTask_fsdmLeds (void * parameter)
             // Update complete, reset the update timeout
             vTaskSetTimeOutState( &xUpdateTO );
             
-            ledFsmState = LEDFSM_STATE_IDLE;
+            fsmledState = LEDFSM_STATE_IDLE;
             break;
         
         default:
             break;
         }
 
-        vTaskDelay(10 / portTICK_PERIOD_MS); // TODO remove hardcoded 0.01s delay 
     }
     
     // Delete a task when finished 
@@ -297,10 +329,11 @@ void setup()
         if (xBinSem_cmdBuf != NULL) { xSemaphoreGive(xBinSem_cmdBuf); }
     }
 
-    if (xBinSem_ledsState == NULL)
+    // Queues
+    xQLedfsm = xQueueCreate( 10, sizeof(cmdItem) );
+    if(xQLedfsm == 0)
     {
-        xBinSem_ledsState = xSemaphoreCreateBinary();
-        if (xBinSem_ledsState != NULL) { xSemaphoreGive(xBinSem_ledsState); }
+        // TODO: Handle failed to create queue
     }
 
     // RTOS Tasks
@@ -313,7 +346,7 @@ void setup()
         NULL);                      // Task handle
 
     xTaskCreate(
-        xTask_fsdmLeds,             // Function name
+        xTask_fsmLeds,             // Function name
         "LED FSM",                  // Task name
         10000,                      // Stack size
         NULL,                       // Task parameter
@@ -364,10 +397,6 @@ void loop()
     FastLED.show();
     
     delay(100);
-
-    // Display the current LED state
-    sprintf(strBuffer, "LED Pattern: %d", ::ledsState);
-    Serial.println(strBuffer);
  
 }
 
