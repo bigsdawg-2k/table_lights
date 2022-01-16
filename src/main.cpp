@@ -18,7 +18,7 @@
 #define NUM_BYTES_SERIAL_BT_BUFF 1024
 
 // Task and OS Resource Rest Times
-#define TASK_WAIT_LEDFSM_ms     10
+#define TASK_WAIT_LEDFSM_ms     1000
 #define TASK_WAIT_EXEC_CMD_ms   10
 #define Q_WAIT_LEDFSM_WAIT_ms   10
 
@@ -35,13 +35,13 @@ QueueHandle_t   xQLedfsm;
 // LED Module Instructions
 #define LEDMOD_INST_OFF         0
 #define LEDMOD_INST_ON          1
-#define LEDMOD_INST_SET_LED     2
+#define LEDMOD_INST_SET_PATTERN 2
 
 // LED states
-#define LEDS_UPDATE_PERIOD_ms   50
-#define LEDS_UPDATE_PERIOD_ticks (LEDS_UPDATE_PERIOD_ms / portTICK_PERIOD_MS)
+#define LEDS_UPDATE_PERIOD_ms   500
 #define LEDS_PATTERN_OFF        0
 #define LEDS_PATTERN_STATIC_ON  1
+#define LEDS_PATTERN_BLINK      2
 int gLedsState = 0;
 
 // Define the array of LEDs RGBW struct
@@ -112,6 +112,24 @@ void BTEventCallback(esp_spp_cb_event_t event, esp_spp_cb_param_t *param)
 }
 
 
+void printCommand(cmdItem cmd)
+{
+    Serial.print("Received command: ");
+    Serial.print(cmd.moduleTarget);
+    Serial.print(", ");
+    Serial.print(cmd.instruction);
+    Serial.print(", ");
+    Serial.print(cmd.vArgLen);
+    for (int idx = 0; idx < cmd.vArgLen; idx++)
+    {
+        if (idx == 0) {Serial.print(":");}
+        Serial.print(cmd.vArg[idx]);
+        Serial.print(".");
+    }
+    Serial.print("\n");
+}
+
+
 /**********************************
  * Application tasks              *  
  **********************************/
@@ -132,27 +150,15 @@ void xTask_execCmd (void * parameter)
     while( pdTRUE )
     {
         if (cmdBuf->getOccupied() > 0 && 
-            xSemaphoreTake(xBinSem_cmdBuf, 10 / portTICK_PERIOD_MS)) // TODO remove hardcoded 10ms delay
+            xSemaphoreTake( xBinSem_cmdBuf, 10 / portTICK_PERIOD_MS )) // TODO remove hardcoded 10ms delay
         {
-            tmpInt = cmdBuf->readCmd(&tmpCmd);
-            xSemaphoreGive(xBinSem_cmdBuf);
+            tmpInt = cmdBuf->readCmd( &tmpCmd );
+            xSemaphoreGive( xBinSem_cmdBuf );
         }
 
         if (tmpInt > 0)
         {
-            Serial.print("Received command: ");
-            Serial.print(tmpCmd.moduleTarget);
-            Serial.print(", ");
-            Serial.print(tmpCmd.instruction);
-            Serial.print(", ");
-            Serial.print(tmpCmd.vArgLen);
-            for (tmpInt = 0; tmpInt < tmpCmd.vArgLen; tmpInt++)
-            {
-                if (tmpInt == 0) {Serial.print(":");}
-                Serial.print(tmpCmd.vArg[tmpInt]);
-                Serial.print(".");
-            }
-            Serial.println("");
+            printCommand(tmpCmd);
             tmpInt = 0;
 
             switch (tmpCmd.moduleTarget)
@@ -199,55 +205,63 @@ void xTask_fsmLeds (void * parameter)
     int fsmledState = LEDFSM_STATE_RESET;
 
     // LED variables
-    bool ledsEnabled = pdFALSE;
+    bool    ledsEnabled;
+    int     ledsPattern;
+    int     ledsBlink_ms;
     cmdItem cmdFromQ;
 
     // Managing the updated period tracking
-    TickType_t  xTicksToUpdate = LEDS_UPDATE_PERIOD_ticks;
-    TimeOut_t   xUpdateTO;
+    TickType_t  xTicksToLedUpdate = LEDS_UPDATE_PERIOD_ms / portTICK_PERIOD_MS;
+    TimeOut_t   xLedsUpdateTO;
     
     while( true )
     {
         
         switch( fsmledState )
         {
-        
         case LEDFSM_STATE_RESET:
             
             // Start the LED update timeout
-            vTaskSetTimeOutState( &xUpdateTO );
             ledsEnabled = pdFALSE;
+            ledsPattern = LEDS_PATTERN_OFF;
+            ledsBlink_ms = 1000;
             fsmledState = LEDFSM_STATE_UPDATE;
             break;
         
         case LEDFSM_STATE_IDLE:
 
             // Check command queue
-            if( xQueueReceive(xQLedfsm, &cmdFromQ, 0) == pdTRUE )
+            if( xQueueReceive( xQLedfsm, &cmdFromQ, 0) == pdTRUE )
             {
                 fsmledState = LEDFSM_STATE_COMMAND;
                 break;
-            }
+            } 
             // Due for an update
-            if( xTaskCheckForTimeOut( &xUpdateTO, &xTicksToUpdate ) == pdTRUE )
+            else if( ledsEnabled && xTaskCheckForTimeOut( &xLedsUpdateTO, &xTicksToLedUpdate ) == pdTRUE )
             {
                 fsmledState = LEDFSM_STATE_UPDATE;
                 break;
             }
-            // Nothing to do, rest
-            else if( xTicksToUpdate < TASK_WAIT_LEDFSM_ms / portTICK_PERIOD_MS )
+            // Due for an update soon
+            else if(  ledsEnabled && xTicksToLedUpdate < TASK_WAIT_LEDFSM_ms / portTICK_PERIOD_MS )
             {
-                vTaskDelay( xTicksToUpdate );
+                Serial.printf("Waiting shortly (%d)\n", xTicksToLedUpdate);
+                vTaskDelay( xTicksToLedUpdate );
             }
+            // Nothing to do, just delay
             else
             {
+                Serial.printf("Waiting normally\n");
                 vTaskDelay( TASK_WAIT_LEDFSM_ms / portTICK_PERIOD_MS );
             }
+            
             break;
         
         // Handle command for the LED module from the queue
         case LEDFSM_STATE_COMMAND:
-            
+
+            printCommand(cmdFromQ);
+
             switch( cmdFromQ.instruction )
             {
             case LEDMOD_INST_OFF:
@@ -260,11 +274,11 @@ void xTask_fsmLeds (void * parameter)
                 ledsEnabled = pdTRUE;
                 break;
 
-            case LEDMOD_INST_SET_LED:
-                Serial.printf("Setting LED(s) to (%d)\n", cmdFromQ.vArg[0]);
+            case LEDMOD_INST_SET_PATTERN:
+                Serial.printf( "Setting LED(s) to (%d)\n", cmdFromQ.vArg[0] );
                 if( cmdFromQ.vArgLen > 0 )
                 {
-                    ledsEnabled = cmdFromQ.vArg[0];
+                    ledsPattern = cmdFromQ.vArg[0];
                 }
                 break;
 
@@ -276,17 +290,33 @@ void xTask_fsmLeds (void * parameter)
             // Get rid of any arguments now that they have been used
             if( cmdFromQ.vArgLen > 0 )
             {
-                free(cmdFromQ.vArg);
+                free( cmdFromQ.vArg );
+                cmdFromQ.vArgLen = 0;
             }
 
             fsmledState = LEDFSM_STATE_IDLE;
             break;
         
         case LEDFSM_STATE_UPDATE:
+
+            Serial.printf("Updating LEDs\n");
+            switch( ledsPattern )
+            {
+            case LEDS_PATTERN_OFF:
+                digitalWrite(PIN_LEDS_BUILTIN, LOW);
+                break;
+            case LEDS_PATTERN_STATIC_ON:
+                digitalWrite(PIN_LEDS_BUILTIN, HIGH);
+                break;
+            case LEDS_PATTERN_BLINK:
+                break;
+            default:
+                break;
+            }
             
             // Update complete, reset the update timeout
-            vTaskSetTimeOutState( &xUpdateTO );
-            
+            vTaskSetTimeOutState( &xLedsUpdateTO );
+            xTicksToLedUpdate = LEDS_UPDATE_PERIOD_ms / portTICK_PERIOD_MS;
             fsmledState = LEDFSM_STATE_IDLE;
             break;
         
