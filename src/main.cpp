@@ -266,6 +266,7 @@ void xTask_fsmLeds (void * parameter)
             {
             case LEDMOD_INST_OFF:
                 Serial.printf("Turning LED(s) off.\n");
+                digitalWrite(PIN_LEDS_BUILTIN, LOW);
                 ledsEnabled = pdFALSE;
                 break;
 
